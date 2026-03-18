@@ -39,7 +39,7 @@ export type { CreateFeishuReplyDispatcherParams } from './reply-dispatcher-types
 
 export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherParams): FeishuReplyDispatcherResult {
   const core = LarkClient.runtime;
-  const { cfg, agentId, chatId, replyToMessageId, accountId, replyInThread } = params;
+  const { cfg, agentId, chatId, sessionKey, replyToMessageId, accountId, replyInThread } = params;
 
   // Resolve account so we can read per-account config (e.g. replyMode)
   const account = getLarkAccount(cfg, accountId);
@@ -59,6 +59,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
 
   // ---- Block streaming for static mode ----
   const enableBlockStreaming = feishuCfg?.blockStreaming === true && !useStreamingCards;
+  const reasoning = {
+    enable: feishuCfg?.reasoning?.enable !== false,
+    showFullPaths: feishuCfg?.reasoning?.showFullPaths === true,
+  };
 
   const resolvedFooter = resolveFooterConfig(feishuCfg?.footer);
 
@@ -82,8 +86,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         cfg,
         accountId,
         chatId,
+        sessionKey,
         replyToMessageId,
         replyInThread,
+        reasoning,
         resolvedFooter,
       })
     : null;
@@ -312,6 +318,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         ? {
             onReasoningStream: (payload: ReplyPayload) => controller.onReasoningStream(payload),
             onPartialReply: (payload: ReplyPayload) => controller.onPartialReply(payload),
+            onToolStart: (payload: { name?: string; phase?: string }) => controller.onToolStart(payload),
+            onToolResult: (payload: ReplyPayload) => controller.onToolResult(payload),
           }
         : {}),
     },
