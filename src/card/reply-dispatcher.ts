@@ -22,8 +22,9 @@ import { sendMediaLark } from '../messaging/outbound/deliver';
 import { sendMarkdownCardFeishu, sendMessageFeishu } from '../messaging/outbound/send';
 import { type TypingIndicatorState, addTypingIndicator, removeTypingIndicator } from '../messaging/outbound/typing';
 import { isCardTableLimitError } from './card-error';
-import { registerCompletedCard } from './card-registry';
+import { buildConversationKey, consumeCompletedCard, registerCompletedCard } from './card-registry';
 import type { CreateFeishuReplyDispatcherParams, FeishuReplyDispatcherResult } from './reply-dispatcher-types';
+import { flushBufferedCompletions } from './subagent-completion-handler';
 import { hasActiveSubagents } from './subagent-tracker';
 import { expandAutoMode, resolveReplyMode, shouldUseCard } from './reply-mode';
 import { StreamingCardController } from './streaming-card-controller';
@@ -178,6 +179,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
 
   // ---- dispatchFullyComplete flag (static mode) ----
   let dispatchFullyComplete = false;
+  // ---- earlyRegistered flag (streaming mode) ----
+  let earlyRegistered = false;
 
   // ---- Build dispatcher ----
   const { dispatcher, replyOptions, markDispatchIdle } = core.channel.reply.createReplyDispatcherWithTyping({
@@ -229,6 +232,24 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         if (controller.isTerminated) return;
 
         if (controller.cardMessageId) {
+          // Early-register so subagent completions arriving during streaming can buffer
+          if (!earlyRegistered && feishuCfg?.subagent?.mergeToMain !== false) {
+            earlyRegistered = true;
+            registerCompletedCard({
+              context: { to: chatId, accountId, threadId },
+              messageId: controller.cardMessageId,
+              cardKitCardId: controller.cardKitCardId,
+              cardKitSequence: controller.cardKitSequence,
+              completedText: '',
+              phase: 'main_streaming',
+              activeSubagentCount: 0,
+              streamingOpen: true,
+              startedAt: controller.startTime,
+              footer: resolvedFooter,
+              bufferedCompletions: [],
+              appliedCompletionIds: [],
+            });
+          }
           await controller.onDeliver(payload);
           return;
         }
@@ -398,6 +419,32 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             startedAt: controller.startTime,
             footer: resolvedFooter,
           });
+
+          // Flush any completions that buffered during main_streaming phase
+          const registryKey = buildConversationKey({ to: chatId, accountId, threadId });
+          const bufferedEntry = consumeCompletedCard(registryKey);
+          if (bufferedEntry) {
+            if (bufferedEntry.bufferedCompletions.length > 0) {
+              await flushBufferedCompletions({ entry: bufferedEntry, cfg, chatId, accountId, threadId });
+            } else {
+              // Re-register since consumeCompletedCard removed it
+              registerCompletedCard({
+                context: { to: chatId, accountId, threadId },
+                messageId: bufferedEntry.messageId,
+                cardKitCardId: bufferedEntry.cardKitCardId,
+                cardKitSequence: bufferedEntry.cardKitSequence,
+                completedText: bufferedEntry.completedText,
+                originalCompletedText: bufferedEntry.originalCompletedText,
+                streamingOpen: bufferedEntry.streamingOpen,
+                startedAt: bufferedEntry.startedAt,
+                footer: bufferedEntry.footer,
+                phase: bufferedEntry.phase,
+                activeSubagentCount: bufferedEntry.activeSubagentCount,
+                bufferedCompletions: bufferedEntry.bufferedCompletions,
+                appliedCompletionIds: bufferedEntry.appliedCompletionIds,
+              });
+            }
+          }
         } else {
           // No active subagents — finalize normally.
           await controller.onIdle();

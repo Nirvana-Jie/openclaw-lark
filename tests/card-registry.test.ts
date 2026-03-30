@@ -85,6 +85,16 @@ describe('card-registry key isolation', () => {
     expect(key.startsWith('feishu|')).toBe(true);
   });
 
+  it('returns undefined for entries older than TTL', () => {
+    vi.useFakeTimers();
+    const to = 'oc_ttl_test';
+    const key = buildConversationKey({ to, accountId: 'acc1' });
+    reg({ to, accountId: 'acc1' });
+    vi.advanceTimersByTime(5 * 60 * 1000 + 1); // just past 5-minute TTL
+    expect(consumeCompletedCard(key)).toBeUndefined();
+    vi.useRealTimers();
+  });
+
   it('entry with phase and new fields is preserved through register/consume cycle', () => {
     const to = 'oc_phase_test';
     const key = buildConversationKey({ to, accountId: 'acct', threadId: 't1' });
