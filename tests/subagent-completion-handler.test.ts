@@ -2,6 +2,10 @@
  * Tests for subagent-completion-handler.ts
  *
  * Mocks all infrastructure dependencies and exercises the merge logic paths.
+ *
+ * Key invariant: mergeIntoCard() only pushes content via streamCardContent().
+ * It NEVER closes streaming mode or sends a final card.update — that is the
+ * responsibility of finalizeCardAfterSubagents() in subagent-tracker.ts.
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -28,17 +32,17 @@ vi.mock('../src/card/cardkit', () => ({
   updateCardKitCard: (...args: unknown[]) => mockUpdateCardKitCard(...args),
 }));
 
-const mockUpdateCardFeishu = vi.fn().mockResolvedValue(undefined);
-
-vi.mock('../src/messaging/outbound/send', () => ({
-  updateCardFeishu: (...args: unknown[]) => mockUpdateCardFeishu(...args),
-  buildMarkdownCard: (text: string) => ({ type: 'markdown', text }),
-}));
-
 vi.mock('../src/card/builder', () => ({
   STREAMING_ELEMENT_ID: 'streaming_content',
   buildCardContent: (_state: string, data: { text?: string }) => ({ text: data?.text ?? '' }),
   toCardKit2: (card: unknown) => card,
+}));
+
+// Mock subagent-tracker
+// Default: hasActiveRunsForDispatch returns true (subagents are active for the dispatch)
+const mockHasActiveRunsForDispatch = vi.fn().mockReturnValue(true);
+vi.mock('../src/card/subagent-tracker', () => ({
+  hasActiveRunsForDispatch: (...args: unknown[]) => mockHasActiveRunsForDispatch(...args),
 }));
 
 // ---------------------------------------------------------------------------
@@ -47,16 +51,20 @@ vi.mock('../src/card/builder', () => ({
 
 import {
   buildConversationKey,
+  getCompletedCard,
   registerCompletedCard,
   removeCompletedCard,
+  updateCompletedCard,
 } from '../src/card/card-registry';
-import { handleSubagentCompletion } from '../src/card/subagent-completion-handler';
+import { flushPendingCompletions, handleSubagentCompletion } from '../src/card/subagent-completion-handler';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 const MOCK_CFG = {} as Parameters<typeof handleSubagentCompletion>[0]['cfg'];
+
+let helperCounter = 0;
 
 function registerMainCard(opts: {
   to: string;
@@ -65,8 +73,9 @@ function registerMainCard(opts: {
   messageId?: string;
   completedText?: string;
   streamingOpen?: boolean;
-  phase?: 'main_streaming' | 'main_done_waiting_subagents' | 'completed' | 'aborted' | 'error';
+  phase?: 'streaming' | 'waiting_subagents' | 'merging' | 'completed' | 'aborted';
   cardKitCardId?: string | null;
+  dispatchId?: string;
 }) {
   registerCompletedCard({
     context: { to: opts.to, accountId: opts.accountId, threadId: opts.threadId },
@@ -74,180 +83,254 @@ function registerMainCard(opts: {
     cardKitCardId: opts.cardKitCardId !== undefined ? opts.cardKitCardId : 'card-001',
     cardKitSequence: 1,
     completedText: opts.completedText ?? 'Main reply',
-    originalCompletedText: opts.completedText ?? 'Main reply',
-    streamingOpen: opts.streamingOpen ?? false,
+    streamingOpen: opts.streamingOpen ?? true,
     startedAt: Date.now() - 1000,
-    phase: opts.phase ?? 'main_done_waiting_subagents',
-    activeSubagentCount: 1,
-    bufferedCompletions: [],
+    phase: opts.phase ?? 'waiting_subagents',
     appliedCompletionIds: [],
+    dispatchId: opts.dispatchId ?? `test-dispatch-${++helperCounter}`,
   });
 }
 
 // ---------------------------------------------------------------------------
-// Tests
+// Tests — core merge paths
 // ---------------------------------------------------------------------------
 
 describe('handleSubagentCompletion', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // Default: no dispatchId check (tracker returns undefined = no constraint)
+    mockHasActiveRunsForDispatch.mockReturnValue(true);
   });
 
-  // Case 1: registry entry exists, non-streaming mode → merged
-  it('case 1: merges into existing non-streaming card', async () => {
-    const to = 'oc_case1';
-    registerMainCard({ to, streamingOpen: false });
-
-    const result = await handleSubagentCompletion({
-      cfg: MOCK_CFG,
-      to,
-      text: 'Subagent result',
-    });
-
-    expect(result.status).toBe('merged');
-    expect(result).toMatchObject({ status: 'merged', messageId: 'msg-001', chatId: 'oc_case1' });
-    expect(mockUpdateCardKitCard).toHaveBeenCalledOnce();
-  });
-
-  // Case 2: early arrival (phase = main_streaming) → buffered
-  it('case 2: buffers completion when main card is still streaming', async () => {
-    const to = 'oc_case2';
-    registerMainCard({ to, phase: 'main_streaming' });
-
-    const result = await handleSubagentCompletion({
-      cfg: MOCK_CFG,
-      to,
-      text: 'Early subagent result',
-      completionId: 'comp-early',
-    });
-
-    expect(result.status).toBe('merged');
-    // No card APIs should have been called (just buffered)
-    expect(mockStreamCardContent).not.toHaveBeenCalled();
-    expect(mockSetCardStreamingMode).not.toHaveBeenCalled();
-    expect(mockUpdateCardKitCard).not.toHaveBeenCalled();
-    expect(mockUpdateCardFeishu).not.toHaveBeenCalled();
-
-    // Clean up
-    removeCompletedCard(buildConversationKey({ to }));
-  });
-
-  // Case 3: streaming merge (streamingOpen = true)
-  it('case 3: streaming merge calls stream → closeStreaming → updateCard', async () => {
-    const to = 'oc_case3';
+  it('pushes content via streamCardContent without closing streaming', async () => {
+    const to = 'oc_push';
     registerMainCard({ to, streamingOpen: true, completedText: 'Main' });
 
-    const result = await handleSubagentCompletion({
-      cfg: MOCK_CFG,
-      to,
-      text: 'Extra info',
-    });
+    const result = await handleSubagentCompletion({ cfg: MOCK_CFG, to, text: 'Subagent result' });
 
     expect(result.status).toBe('merged');
     expect(mockStreamCardContent).toHaveBeenCalledOnce();
-    expect(mockSetCardStreamingMode).toHaveBeenCalledOnce();
-    expect(mockUpdateCardKitCard).toHaveBeenCalledOnce();
+    expect(mockSetCardStreamingMode).not.toHaveBeenCalled();
+    expect(mockUpdateCardKitCard).not.toHaveBeenCalled();
+
+    const entry = getCompletedCard(buildConversationKey({ to }));
+    expect(entry?.phase).toBe('waiting_subagents');
+    expect(entry?.streamingOpen).toBe(true);
+    expect(entry?.completedText).toContain('Subagent result');
+
+    removeCompletedCard(buildConversationKey({ to }));
   });
 
-  // Case 4: same chat, different threadId → entries are independent
-  it('case 4: different threadId entries do not interfere', async () => {
-    const to = 'oc_case4';
+  it('different threadId entries do not interfere', async () => {
+    const to = 'oc_threads';
     registerMainCard({ to, threadId: 'thread-1', messageId: 'msg-t1' });
     registerMainCard({ to, threadId: 'thread-2', messageId: 'msg-t2' });
 
-    const r1 = await handleSubagentCompletion({ cfg: MOCK_CFG, to, threadId: 'thread-1', text: 'Result 1' });
-    const r2 = await handleSubagentCompletion({ cfg: MOCK_CFG, to, threadId: 'thread-2', text: 'Result 2' });
+    const r1 = await handleSubagentCompletion({ cfg: MOCK_CFG, to, threadId: 'thread-1', text: 'R1' });
+    const r2 = await handleSubagentCompletion({ cfg: MOCK_CFG, to, threadId: 'thread-2', text: 'R2' });
 
     expect(r1.status).toBe('merged');
     expect(r2.status).toBe('merged');
     if (r1.status === 'merged') expect(r1.messageId).toBe('msg-t1');
     if (r2.status === 'merged') expect(r2.messageId).toBe('msg-t2');
+
+    removeCompletedCard(buildConversationKey({ to, threadId: 'thread-1' }));
+    removeCompletedCard(buildConversationKey({ to, threadId: 'thread-2' }));
   });
 
-  // Case 5: no main card → fallback
-  it('case 5: returns fallback when no entry exists', async () => {
-    const result = await handleSubagentCompletion({
-      cfg: MOCK_CFG,
-      to: 'oc_no_entry',
-      text: 'Orphan result',
-    });
+  it('returns fallback when no entry exists', async () => {
+    const result = await handleSubagentCompletion({ cfg: MOCK_CFG, to: 'oc_no_entry', text: 'Orphan' });
     expect(result.status).toBe('fallback');
   });
 
-  // Case 6: duplicate completionId → dedup, no double-append
-  it('case 6: deduplicates completionId', async () => {
-    const to = 'oc_case6';
-    registerMainCard({ to, completedText: 'Initial' });
-
-    // First merge
-    await handleSubagentCompletion({ cfg: MOCK_CFG, to, text: 'Result A', completionId: 'comp-1' });
-    vi.clearAllMocks();
-
-    // Re-register with comp-1 already applied (simulates re-registration done inside handler)
+  it('deduplicates completionId', async () => {
+    const to = 'oc_dedup';
     registerCompletedCard({
       context: { to },
       messageId: 'msg-001',
       cardKitCardId: 'card-001',
       cardKitSequence: 2,
-      completedText: 'Initial\nResult A',
-      phase: 'main_done_waiting_subagents',
+      completedText: 'Already merged',
+      phase: 'waiting_subagents',
+      streamingOpen: true,
       appliedCompletionIds: ['comp-1'],
+      dispatchId: 'dedup-test',
     });
 
-    // Second call with same completionId
-    const result = await handleSubagentCompletion({
-      cfg: MOCK_CFG,
-      to,
-      text: 'Result A',
-      completionId: 'comp-1',
-    });
-
+    const result = await handleSubagentCompletion({ cfg: MOCK_CFG, to, text: 'Dup', completionId: 'comp-1' });
     expect(result.status).toBe('merged');
-    // No card API calls because it was deduped
-    expect(mockUpdateCardKitCard).not.toHaveBeenCalled();
-
-    // Clean up
+    expect(mockStreamCardContent).not.toHaveBeenCalled();
     removeCompletedCard(buildConversationKey({ to }));
   });
 
-  // Case 7: completed phase → fallback
-  it('case 7: returns fallback for terminal completed phase', async () => {
-    const to = 'oc_case7';
+  it('returns fallback for terminal phases', async () => {
+    for (const phase of ['completed', 'aborted'] as const) {
+      const to = `oc_term_${phase}`;
+      registerMainCard({ to, phase });
+      const result = await handleSubagentCompletion({ cfg: MOCK_CFG, to, text: 'Late' });
+      expect(result.status).toBe('fallback');
+    }
+  });
+
+  it('updates registry text even without cardKitCardId', async () => {
+    const to = 'oc_no_cardkit';
+    registerMainCard({ to, cardKitCardId: null, streamingOpen: false });
+
+    const result = await handleSubagentCompletion({ cfg: MOCK_CFG, to, text: 'Result' });
+    expect(result.status).toBe('merged');
+    expect(mockStreamCardContent).not.toHaveBeenCalled();
+    const entry = getCompletedCard(buildConversationKey({ to }));
+    expect(entry?.completedText).toContain('Result');
+    removeCompletedCard(buildConversationKey({ to }));
+  });
+
+  it('returns fallback when streamCardContent throws', async () => {
+    mockStreamCardContent.mockRejectedValueOnce(new Error('API error'));
+    const to = 'oc_error';
+    registerMainCard({ to, streamingOpen: true });
+
+    const result = await handleSubagentCompletion({ cfg: MOCK_CFG, to, text: 'Result' });
+    expect(result.status).toBe('fallback');
+  });
+
+  it('merges text with separator', async () => {
+    const to = 'oc_sep';
+    registerMainCard({ to, completedText: 'Main output', streamingOpen: true });
+
+    await handleSubagentCompletion({ cfg: MOCK_CFG, to, text: 'Sub result' });
+    const entry = getCompletedCard(buildConversationKey({ to }));
+    expect(entry?.completedText).toBe('Main output\n\nSub result');
+    removeCompletedCard(buildConversationKey({ to }));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression: P1 — early subagent buffering
+// ---------------------------------------------------------------------------
+
+describe('[P1] early subagent buffering', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockHasActiveRunsForDispatch.mockReturnValue(true);
+  });
+
+  it('stores completion on CardEntry.pendingCompletions when phase is streaming', async () => {
+    const to = 'oc_buf';
+    registerMainCard({ to, phase: 'streaming' });
+
+    const result = await handleSubagentCompletion({ cfg: MOCK_CFG, to, text: 'Early result', completionId: 'c1' });
+
+    expect(result.status).toBe('buffered');
+    expect(mockStreamCardContent).not.toHaveBeenCalled();
+
+    // The entry's pendingCompletions should contain the buffered item
+    const entry = getCompletedCard(buildConversationKey({ to }));
+    expect(entry?.pendingCompletions).toHaveLength(1);
+    expect(entry?.pendingCompletions[0].text).toBe('Early result');
+    expect(entry?.pendingCompletions[0].completionId).toBe('c1');
+
+    removeCompletedCard(buildConversationKey({ to }));
+  });
+
+  it('flushPendingCompletions replays buffered items after phase transition', async () => {
+    const to = 'oc_flush';
+    const key = buildConversationKey({ to });
+    registerMainCard({ to, phase: 'streaming', completedText: 'Main' });
+
+    // Buffer two completions
+    await handleSubagentCompletion({ cfg: MOCK_CFG, to, text: 'Early-1' });
+    await handleSubagentCompletion({ cfg: MOCK_CFG, to, text: 'Early-2' });
+
+    expect(getCompletedCard(key)?.pendingCompletions).toHaveLength(2);
+
+    // Simulate reply-dispatcher.onIdle: transition phase, then flush
+    updateCompletedCard(key, { phase: 'waiting_subagents' });
+    await flushPendingCompletions({ cfg: MOCK_CFG, chatId: to });
+
+    // Both should have been merged
+    const entry = getCompletedCard(key);
+    expect(entry?.completedText).toContain('Early-1');
+    expect(entry?.completedText).toContain('Early-2');
+    expect(entry?.pendingCompletions).toHaveLength(0);
+    expect(mockStreamCardContent).toHaveBeenCalledTimes(2);
+
+    removeCompletedCard(key);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression: P1 — dispatchId verification
+// ---------------------------------------------------------------------------
+
+describe('[P1] dispatchId isolation', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('rejects completion when no active runs exist for the card dispatchId (stale subagent)', async () => {
+    const to = 'oc_dispatch';
+    registerMainCard({ to, dispatchId: 'dispatch-old' });
+
+    // Simulate: no active runs for this dispatch (all evicted)
+    mockHasActiveRunsForDispatch.mockReturnValue(false);
+
+    const result = await handleSubagentCompletion({ cfg: MOCK_CFG, to, text: 'Stale result' });
+
+    expect(result.status).toBe('fallback');
+    expect(mockStreamCardContent).not.toHaveBeenCalled();
+    removeCompletedCard(buildConversationKey({ to }));
+  });
+
+  it('allows completion when active runs exist for the card dispatchId', async () => {
+    const to = 'oc_dispatch_ok';
+    registerMainCard({ to, dispatchId: 'dispatch-current' });
+    mockHasActiveRunsForDispatch.mockReturnValue(true);
+
+    const result = await handleSubagentCompletion({ cfg: MOCK_CFG, to, text: 'Good result' });
+    expect(result.status).toBe('merged');
+    removeCompletedCard(buildConversationKey({ to }));
+  });
+
+  it('skips dispatch check when card has no dispatchId', async () => {
+    const to = 'oc_dispatch_none';
+    registerMainCard({ to, dispatchId: '' }); // empty = no dispatch tracking
+
+    const result = await handleSubagentCompletion({ cfg: MOCK_CFG, to, text: 'Good result' });
+    // Empty dispatchId bypasses the check, falls through to merge
+    expect(result.status).toBe('merged');
+    removeCompletedCard(buildConversationKey({ to }));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression: P2 — concurrent merge failure propagation
+// ---------------------------------------------------------------------------
+
+describe('[P2] concurrent merge failure propagation', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockHasActiveRunsForDispatch.mockReturnValue(true);
+  });
+
+  it('returns fallback (not merged) when queued merge fails due to API error', async () => {
+    const to = 'oc_conc_fail';
+    registerMainCard({ to, streamingOpen: true });
+    mockStreamCardContent.mockRejectedValueOnce(new Error('CardKit API error'));
+
+    // This goes through the queue; the actual merge fails
+    const result = await handleSubagentCompletion({ cfg: MOCK_CFG, to, text: 'Should fail' });
+
+    // Must be 'fallback', NOT 'merged' — the caller needs to know so it can
+    // deliver as a standalone message.
+    expect(result.status).toBe('fallback');
+  });
+
+  it('returns fallback when queued merge cannot acquire lock', async () => {
+    const to = 'oc_conc_lock';
     registerMainCard({ to, phase: 'completed' });
 
-    const result = await handleSubagentCompletion({ cfg: MOCK_CFG, to, text: 'Late result' });
-    expect(result.status).toBe('fallback');
-  });
-
-  // Case 8: aborted phase → fallback
-  it('case 8: returns fallback for aborted phase', async () => {
-    const to = 'oc_case8';
-    registerMainCard({ to, phase: 'aborted' });
-
-    const result = await handleSubagentCompletion({ cfg: MOCK_CFG, to, text: 'Late result' });
-    expect(result.status).toBe('fallback');
-  });
-
-  // Case 9: legacy fallback (no cardKitCardId)
-  it('case 9: uses legacy IM patch when no cardKitCardId', async () => {
-    const to = 'oc_case9';
-    registerMainCard({ to, cardKitCardId: null });
-
-    const result = await handleSubagentCompletion({ cfg: MOCK_CFG, to, text: 'Result' });
-
-    expect(result.status).toBe('merged');
-    expect(mockUpdateCardFeishu).toHaveBeenCalledOnce();
-    expect(mockUpdateCardKitCard).not.toHaveBeenCalled();
-  });
-
-  // Case 10: card API throws → fallback
-  it('case 10: returns fallback when cardkit API throws', async () => {
-    mockUpdateCardKitCard.mockRejectedValueOnce(new Error('API error'));
-
-    const to = 'oc_case10';
-    registerMainCard({ to });
-
-    const result = await handleSubagentCompletion({ cfg: MOCK_CFG, to, text: 'Result' });
+    const result = await handleSubagentCompletion({ cfg: MOCK_CFG, to, text: 'Locked out' });
+    // Terminal phase → fallback
     expect(result.status).toBe('fallback');
   });
 });

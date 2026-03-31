@@ -188,12 +188,16 @@ export const FeishuAccountConfigSchema = z.object({
   dedup: DedupSchema,
   reactionNotifications: ReactionNotificationModeSchema,
   threadSession: z.boolean().optional(),
+  /**
+   * Default delivery mode for `sendText` calls.
+   * - 'text': send as plain text message (default)
+   * - 'card': send as a complete card with header and footer
+   */
+  delivery: z.enum(['text', 'card']).optional(),
   subagent: z
     .object({
       /** Merge subagent output into the main agent's streaming card (default: true). */
       mergeToMain: z.boolean().optional(),
-      /** When not merging, how to deliver the subagent result: 'card' | 'text' (default: 'text'). */
-      deliveryType: z.enum(['card', 'text']).optional(),
     })
     .optional(),
   uat: UATConfigSchema,

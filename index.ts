@@ -27,7 +27,7 @@ import {
 import { registerCommands } from './src/commands/index';
 import { larkLogger } from './src/core/lark-logger';
 import { emitSecurityWarnings } from './src/core/security-check';
-import { trackSubagentEnded, trackSubagentSpawned } from './src/card/subagent-tracker';
+import { finalizeCardAfterSubagents, trackSubagentEnded, trackSubagentSpawned } from './src/card/subagent-tracker';
 import { normalizeFeishuTarget } from './src/core/targets';
 
 const log = larkLogger('plugin');
@@ -159,9 +159,18 @@ const plugin = {
       });
     });
 
-    api.on('subagent_ended', (event) => {
-      if (event.runId) {
-        trackSubagentEnded(event.runId);
+    api.on('subagent_ended', async (event) => {
+      if (!event.runId) return;
+      const result = trackSubagentEnded(event.runId);
+      if (result.allDone && result.conversationContext) {
+        const cfg = LarkClient.runtime.config.loadConfig();
+        await finalizeCardAfterSubagents({
+          cfg,
+          to: result.conversationContext.to,
+          accountId: result.conversationContext.accountId,
+          threadId: result.conversationContext.threadId,
+          expectedDispatchId: result.dispatchId,
+        });
       }
     });
 

@@ -4,24 +4,35 @@
  *
  * Dedicated handler for subagent completion merges.
  *
- * Isolates the "merge subagent result into main streaming card" logic that
- * previously lived inline in `outbound.ts sendText()`.  This module owns
- * the card-update flow and all phase transitions for the CardEntry state
- * machine.
+ * Merges subagent result text into the main streaming card WITHOUT
+ * closing streaming or finalizing.  Card finalization is handled by
+ * the subagent tracker once ALL subagents have ended.
+ *
+ * Key invariants:
+ * - `streaming` phase: completions are stored in `pendingCompletions` on the
+ *   CardEntry and replayed when the reply-dispatcher transitions to
+ *   `waiting_subagents` (via `flushPendingCompletions`).
+ * - `waiting_subagents` phase: completions are merged immediately.
+ * - `merging` phase: completions are queued behind the in-flight merge and
+ *   the caller blocks until the queued merge resolves (returning the real
+ *   result, not an optimistic `merged`).
+ * - dispatchId is verified against the card entry so that completions from
+ *   a superseded dispatch are rejected.
  */
 
 import type { ClawdbotConfig } from 'openclaw/plugin-sdk';
 import { larkLogger } from '../core/lark-logger';
 import { normalizeFeishuTarget } from '../core/targets';
-import { STREAMING_ELEMENT_ID, buildCardContent, toCardKit2 } from './builder';
 import {
-  type CardEntry,
+  acquireMergeLock,
   buildConversationKey,
-  consumeCompletedCard,
-  registerCompletedCard,
+  getCompletedCard,
+  releaseMergeLock,
+  updateCompletedCard,
 } from './card-registry';
-import { setCardStreamingMode, streamCardContent, updateCardKitCard } from './cardkit';
-import { buildMarkdownCard, updateCardFeishu } from '../messaging/outbound/send';
+import { STREAMING_ELEMENT_ID } from './builder';
+import { streamCardContent } from './cardkit';
+import { hasActiveRunsForDispatch } from './subagent-tracker';
 
 const log = larkLogger('card/subagent-completion-handler');
 
@@ -31,19 +42,33 @@ const log = larkLogger('card/subagent-completion-handler');
 
 export type SubagentCompletionResult =
   | { status: 'merged'; messageId: string; chatId: string }
+  | { status: 'buffered'; messageId: string; chatId: string }
   | { status: 'fallback' };
+
+// ---------------------------------------------------------------------------
+// Merge queue — serialises concurrent subagent completions per conversation.
+// ---------------------------------------------------------------------------
+
+const mergeQueues = new Map<string, Promise<void>>();
+
+function enqueueMerge(key: string, fn: () => Promise<void>): Promise<void> {
+  const prev = mergeQueues.get(key) ?? Promise.resolve();
+  const next = prev.then(fn, fn);
+  mergeQueues.set(key, next);
+  next.finally(() => {
+    if (mergeQueues.get(key) === next) mergeQueues.delete(key);
+  });
+  return next;
+}
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
 /**
- * Try to merge a subagent completion text into the existing main streaming card.
- *
- * Returns `{ status: 'merged' }` when the card was updated (or buffered for
- * later merging while the main card is still streaming).
- * Returns `{ status: 'fallback' }` when no suitable card was found or the card
- * is already in a terminal phase — the caller should fall back to standalone delivery.
+ * Try to merge a subagent completion text into the existing main streaming
+ * card.  The card remains in streaming mode — it is NOT finalized here.
+ * Finalization happens in `trackSubagentEnded()` when the last subagent ends.
  */
 export async function handleSubagentCompletion(params: {
   cfg: ClawdbotConfig;
@@ -57,14 +82,14 @@ export async function handleSubagentCompletion(params: {
   const chatId = normalizeFeishuTarget(to) ?? to;
   const key = buildConversationKey({ to: chatId, accountId, threadId });
 
-  const existing = consumeCompletedCard(key);
+  const existing = getCompletedCard(key);
   if (!existing) {
     log.info('handleSubagentCompletion: no card entry found', { key });
     return { status: 'fallback' };
   }
 
   // Terminal phases — late completions go standalone
-  if (existing.phase === 'completed' || existing.phase === 'aborted' || existing.phase === 'error') {
+  if (existing.phase === 'completed' || existing.phase === 'aborted') {
     log.info('handleSubagentCompletion: card in terminal phase, falling back', {
       phase: existing.phase,
       messageId: existing.messageId,
@@ -72,137 +97,140 @@ export async function handleSubagentCompletion(params: {
     return { status: 'fallback' };
   }
 
-  // Main card is still streaming — buffer the completion for later
-  if (existing.phase === 'main_streaming') {
-    log.info('handleSubagentCompletion: main card still streaming, buffering completion', {
+  // ---- Per-completion dispatch isolation ----
+  // The SDK does not pass a runId with sendText, so we cannot directly verify
+  // which subagent produced this completion.  Instead we check: does the
+  // tracker still have at least one activeRun tagged with the card's
+  // dispatchId?  If not, all subagents for this dispatch have either been
+  // evicted (new dispatch started) or already ended — this sendText is stale.
+  if (existing.dispatchId && !hasActiveRunsForDispatch(chatId, accountId, threadId, existing.dispatchId)) {
+    log.info('handleSubagentCompletion: no active runs for card dispatchId, likely stale — falling back', {
       key,
-      completionId,
+      cardDispatchId: existing.dispatchId,
     });
-    const updated: CardEntry = {
-      ...existing,
-      bufferedCompletions: [
-        ...existing.bufferedCompletions,
-        { text, completionId, arrivedAt: Date.now() },
-      ],
-    };
-    registerCompletedCard({
-      context: { to: chatId, accountId, threadId },
-      messageId: updated.messageId,
-      cardKitCardId: updated.cardKitCardId,
-      cardKitSequence: updated.cardKitSequence,
-      completedText: updated.completedText,
-      originalCompletedText: updated.originalCompletedText,
-      streamingOpen: updated.streamingOpen,
-      startedAt: updated.startedAt,
-      footer: updated.footer,
-      phase: updated.phase,
-      activeSubagentCount: updated.activeSubagentCount,
-      bufferedCompletions: updated.bufferedCompletions,
-      appliedCompletionIds: updated.appliedCompletionIds,
-    });
-    return { status: 'merged', messageId: existing.messageId, chatId };
+    return { status: 'fallback' };
   }
 
-  // phase === 'main_done_waiting_subagents' — perform the actual merge
-  return mergeIntoCard({ cfg, chatId, accountId, threadId, existing, text, completionId });
+  // ---- P1 fix: real buffering for streaming phase ----
+  // Store the completion on the CardEntry so it survives until onIdle flushes.
+  if (existing.phase === 'streaming') {
+    log.info('handleSubagentCompletion: main card still streaming, buffering on entry', { key, completionId });
+    const pending = [...existing.pendingCompletions, { text, completionId }];
+    updateCompletedCard(key, { pendingCompletions: pending });
+    return { status: 'buffered', messageId: existing.messageId, chatId };
+  }
+
+  // ---- P2 fix: queue and wait for real result ----
+  // For both `merging` and `waiting_subagents`, we enqueue and wait for the
+  // actual merge result instead of returning an optimistic `merged`.
+  let result: SubagentCompletionResult = { status: 'fallback' };
+  await enqueueMerge(key, async () => {
+    result = await mergeIntoCard({ cfg, chatId, accountId, threadId, key, text, completionId });
+  });
+  return result;
+}
+
+export interface FlushResult {
+  /** Items that failed to merge and should be delivered standalone. */
+  failed: Array<{ text: string; completionId?: string }>;
 }
 
 /**
- * Flush buffered completions that arrived while the main card was still streaming.
- * Called from reply-dispatcher.ts `onIdle()` after the main reply completes.
+ * Flush completions that were buffered while the main card was still streaming.
+ * Called from reply-dispatcher.onIdle() after phase transitions to
+ * `waiting_subagents`.
+ *
+ * Returns any items that failed to merge so the caller can deliver them as
+ * standalone messages (preventing silent data loss).
  */
-export async function flushBufferedCompletions(params: {
-  entry: CardEntry;
+export async function flushPendingCompletions(params: {
   cfg: ClawdbotConfig;
   chatId: string;
   accountId?: string;
   threadId?: string;
-}): Promise<void> {
-  const { entry, cfg, chatId, accountId, threadId } = params;
-  if (entry.bufferedCompletions.length === 0) return;
+}): Promise<FlushResult> {
+  const { cfg, chatId, accountId, threadId } = params;
+  const key = buildConversationKey({ to: chatId, accountId, threadId });
 
-  log.info('flushing buffered completions', {
-    count: entry.bufferedCompletions.length,
-    messageId: entry.messageId,
-  });
+  const entry = getCompletedCard(key);
+  if (!entry || entry.pendingCompletions.length === 0) return { failed: [] };
 
-  // Apply each buffered completion in order
-  let current = entry;
-  for (const buffered of entry.bufferedCompletions) {
-    const result = await mergeIntoCard({
-      cfg,
-      chatId,
-      accountId,
-      threadId,
-      existing: current,
-      text: buffered.text,
-      completionId: buffered.completionId,
-      // After a buffer flush we re-register with empty bufferedCompletions —
-      // the next iteration picks up the updated entry from the registry.
-      skipReRegister: false,
+  log.info('flushPendingCompletions: flushing', { key, count: entry.pendingCompletions.length });
+
+  const pending = [...entry.pendingCompletions];
+  updateCompletedCard(key, { pendingCompletions: [] });
+
+  const failed: FlushResult['failed'] = [];
+
+  for (const item of pending) {
+    let itemResult: SubagentCompletionResult = { status: 'fallback' };
+    await enqueueMerge(key, async () => {
+      itemResult = await mergeIntoCard({
+        cfg,
+        chatId,
+        accountId,
+        threadId,
+        key,
+        text: item.text,
+        completionId: item.completionId,
+      });
     });
-    if (result.status === 'fallback') {
-      log.warn('flushed completion fell back to standalone', { completionId: buffered.completionId });
-      break;
+    if (itemResult.status === 'fallback') {
+      failed.push(item);
     }
-    // Re-fetch the updated entry for the next iteration
-    const key = buildConversationKey({ to: chatId, accountId, threadId });
-    const next = consumeCompletedCard(key);
-    if (!next) break;
-    current = next;
   }
+
+  if (failed.length > 0) {
+    log.warn('flushPendingCompletions: some items failed', { key, failedCount: failed.length });
+  }
+
+  return { failed };
 }
 
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Push subagent text into the card.  Only updates the streaming content —
+ * does NOT close streaming mode or send a final card.update.
+ */
 async function mergeIntoCard(params: {
   cfg: ClawdbotConfig;
   chatId: string;
   accountId?: string;
   threadId?: string;
-  existing: CardEntry;
+  key: string;
   text: string;
   completionId?: string;
-  skipReRegister?: boolean;
 }): Promise<SubagentCompletionResult> {
-  const { cfg, chatId, accountId, threadId, existing, text, completionId } = params;
+  const { cfg, chatId, accountId, key, text, completionId } = params;
+
+  const existing = acquireMergeLock(key);
+  if (!existing) {
+    log.info('mergeIntoCard: could not acquire lock', { key });
+    return { status: 'fallback' };
+  }
 
   // Dedup check
   if (completionId && existing.appliedCompletionIds.includes(completionId)) {
     log.info('mergeIntoCard: duplicate completionId, skipping', { completionId });
-    // Re-register unchanged so caller can continue
-    reRegisterEntry(existing, chatId, accountId, threadId);
+    releaseMergeLock(key, { phase: 'waiting_subagents' });
     return { status: 'merged', messageId: existing.messageId, chatId };
   }
 
-  // Three-way text merge (preserves the original logic from outbound.ts)
-  const origText = existing.originalCompletedText;
-  let mergedText: string;
-  if (text.startsWith(existing.completedText)) {
-    mergedText = text;
-  } else if (text.startsWith(origText)) {
-    const newContent = text.slice(origText.length).trim();
-    mergedText = newContent ? existing.completedText + '\n' + newContent : existing.completedText;
-  } else {
-    mergedText = existing.completedText + '\n' + text;
-  }
+  const mergedText = existing.completedText ? existing.completedText + '\n\n' + text : text;
 
-  const elapsedMs = Date.now() - existing.startedAt;
-
-  log.info('mergeIntoCard: merging completion', {
+  log.info('mergeIntoCard: pushing content (no finalize)', {
     messageId: existing.messageId,
-    streamingOpen: existing.streamingOpen,
-    elapsedMs,
     completionId,
   });
 
   try {
     let nextSeq = existing.cardKitSequence;
 
-    if (existing.streamingOpen && existing.cardKitCardId) {
-      // 1. Push merged text via streaming API
+    if (existing.cardKitCardId && existing.streamingOpen) {
+      // Push merged text — card stays in streaming mode
       nextSeq += 1;
       await streamCardContent({
         cfg,
@@ -212,92 +240,27 @@ async function mergeIntoCard(params: {
         sequence: nextSeq,
         accountId,
       });
-      log.info('mergeIntoCard: streamed merged content', { seq: nextSeq });
-
-      // 2. Close streaming mode
-      nextSeq += 1;
-      await setCardStreamingMode({
-        cfg,
-        cardId: existing.cardKitCardId,
-        streamingMode: false,
-        sequence: nextSeq,
-        accountId,
-      });
-
-      // 3. Final card.update with footer
-      nextSeq += 1;
-      await updateCardKitCard({
-        cfg,
-        cardId: existing.cardKitCardId,
-        card: toCardKit2(buildCardContent('complete', { text: mergedText, elapsedMs, footer: existing.footer })),
-        sequence: nextSeq,
-        accountId,
-      });
-      log.info('mergeIntoCard: finalized card', { seq: nextSeq, elapsedMs });
-    } else if (existing.cardKitCardId) {
-      // Non-streaming merge: direct card.update
-      nextSeq += 1;
-      await updateCardKitCard({
-        cfg,
-        cardId: existing.cardKitCardId,
-        card: toCardKit2(buildCardContent('complete', { text: mergedText, elapsedMs, footer: existing.footer })),
-        sequence: nextSeq,
-        accountId,
-      });
-    } else {
-      // Legacy IM patch fallback
-      await updateCardFeishu({
-        cfg,
-        messageId: existing.messageId,
-        card: buildMarkdownCard(mergedText),
-        accountId,
-      });
     }
+    // If not streaming or no cardKitCardId, we just update registry text.
+    // The finalization step (in trackSubagentEnded) will handle the final
+    // card.update or legacy IM patch.
 
-    // Build updated entry
     const appliedCompletionIds = completionId
       ? [...existing.appliedCompletionIds, completionId]
       : existing.appliedCompletionIds;
 
-    const updatedEntry: CardEntry = {
-      ...existing,
+    releaseMergeLock(key, {
       cardKitSequence: nextSeq,
       completedText: mergedText,
-      streamingOpen: false,
+      streamingOpen: existing.streamingOpen,
       appliedCompletionIds,
-      bufferedCompletions: [],
-    };
-
-    if (!params.skipReRegister) {
-      reRegisterEntry(updatedEntry, chatId, accountId, threadId);
-    }
+      phase: 'waiting_subagents',
+    });
 
     return { status: 'merged', messageId: existing.messageId, chatId };
   } catch (err) {
-    log.warn('mergeIntoCard: card merge failed', { error: String(err) });
+    log.warn('mergeIntoCard: content push failed', { error: String(err) });
+    releaseMergeLock(key, { phase: 'waiting_subagents' });
     return { status: 'fallback' };
   }
-}
-
-function reRegisterEntry(
-  entry: CardEntry,
-  chatId: string,
-  accountId: string | undefined,
-  threadId: string | undefined,
-): void {
-  registerCompletedCard({
-    context: { to: chatId, accountId, threadId },
-    messageId: entry.messageId,
-    cardKitCardId: entry.cardKitCardId,
-    cardKitSequence: entry.cardKitSequence,
-    completedText: entry.completedText,
-    originalCompletedText: entry.originalCompletedText,
-    streamingOpen: entry.streamingOpen,
-    startedAt: entry.startedAt,
-    footer: entry.footer,
-    phase: entry.phase,
-    activeSubagentCount: entry.activeSubagentCount,
-    bufferedCompletions: entry.bufferedCompletions,
-    appliedCompletionIds: entry.appliedCompletionIds,
-  });
 }

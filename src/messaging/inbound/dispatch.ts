@@ -87,6 +87,7 @@ async function dispatchNormalMessage(
     agentId: dc.route.agentId,
     sessionKey: dc.threadSessionKey ?? dc.route.sessionKey,
     chatId: dc.ctx.chatId,
+    feishuTo: dc.feishuTo,
     replyToMessageId: replyToMessageId ?? dc.ctx.messageId,
     accountId: dc.account.accountId,
     chatType: dc.ctx.chatType,

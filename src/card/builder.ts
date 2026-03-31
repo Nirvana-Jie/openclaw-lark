@@ -441,8 +441,18 @@ function buildCompleteCard(params: {
   footerMetrics?: FooterSessionMetrics;
   statusOverride?: string;
 }): FeishuCard {
-  const { text, toolCalls, elapsedMs, isError, reasoningText, reasoningElapsedMs, isAborted, footer, footerMetrics, statusOverride } =
-    params;
+  const {
+    text,
+    toolCalls,
+    elapsedMs,
+    isError,
+    reasoningText,
+    reasoningElapsedMs,
+    isAborted,
+    footer,
+    footerMetrics,
+    statusOverride,
+  } = params;
   const elements: CardElement[] = [];
 
   // Collapsible reasoning panel (before main content)

@@ -113,6 +113,14 @@ export interface CreateFeishuReplyDispatcherParams {
   agentId: string;
   sessionKey: string;
   chatId: string;
+  /**
+   * The SDK outbound target (e.g. `"chat:oc_xxx"` for groups, `"user:ou_xxx"`
+   * for DMs).  Used to build the card-registry key so it matches the target
+   * that `ChannelOutboundAdapter.sendText()` will later see.
+   *
+   * When omitted, falls back to `chatId`.
+   */
+  feishuTo?: string;
   replyToMessageId?: string;
   /** Account ID for multi-account support. */
   accountId?: string;
